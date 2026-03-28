@@ -279,23 +279,25 @@ class TestSyncFromChangeset:
         assert len(update_actions) == 1
 
     def test_skip_up_to_date_from_changeset(self, base_config, mock_catalogs):
+        """Event-driven sync always overrides — no comparison with destination."""
         source, dest = mock_catalogs
         dest.load_namespace_properties.return_value = {}
         source.load_namespace_properties.return_value = {}
 
         loc = "s3://bucket/t/v1.metadata.json"
         source.load_table.return_value = make_mock_table(loc)
-        dest.load_table.return_value = make_mock_table(loc)
+        # Note: dest.load_table is NOT called in event-driven sync (no comparison)
 
         changeset = ChangeSet()
         changeset.add_table_change("test_ns", "same_table")
 
         result = sync_from_changeset(base_config, changeset)
 
-        dest.register_table.assert_not_called()
-        dest.drop_table.assert_not_called()
-        skip_actions = [a for a in result.actions if a.action == ActionType.SKIP]
-        assert len(skip_actions) == 1
+        # Event-driven sync always overrides: drop + register
+        dest.drop_table.assert_called_once()
+        dest.register_table.assert_called_once()
+        update_actions = [a for a in result.actions if a.action == ActionType.UPDATE]
+        assert len(update_actions) == 1
 
     def test_drop_table_from_changeset(self, base_config, mock_catalogs):
         base_config.sync.drop_orphan_tables = True

@@ -89,13 +89,17 @@ print(result.summary)
 The default mode. Scans all tables in each managed namespace, compares metadata locations between source and destination, and applies the diff:
 
 - **Source only** → `register_table` in destination
-- **Both, same metadata** → skip (up to date)
-- **Both, different metadata** → `drop_table` + `register_table` (update)
+- **Both, same metadata** → skip (up to date, no API calls)
+- **Both, different metadata** → update (drop + register)
 - **Dest only** → `drop_table` if `drop_orphan_tables: true`, else skip
 
 ```bash
 iceberg-catalog-sync --config sync.yaml --mode full
 ```
+
+**Note on table updates:** The Iceberg REST catalog doesn't provide an atomic "update metadata location" API for external table registration. Updates use drop+register which creates a brief window (milliseconds) where the table doesn't exist. The operation is idempotent — if it fails midway, re-running completes it. Data files are never at risk — only the catalog metadata pointer changes.
+
+**Optimization:** Full sync compares `metadata_location` before updating, so unchanged tables are skipped (0 API calls to destination). This is efficient when <10% of tables change between syncs.
 
 ### Event-Driven Partial Sync (via RisingWave)
 
@@ -110,7 +114,8 @@ When `events.enabled: true` in config, `--mode events` is the default.
 **Benefits over full sync:**
 
 - No `list_tables` calls (the most expensive catalog API call)
-- Only loads and compares the specific tables that changed
+- No `load_table` calls to destination (always overrides without comparison)
+- Only loads tables from source that changed
 - Fewer API calls to the destination catalog (critical for rate-limited SaaS destinations)
 - Lower operational cost
 
@@ -127,8 +132,10 @@ Lakekeeper catalog mutation
               → iceberg-catalog-sync (risingwave-py, cursor-based)
                   ├─ filter to managed namespaces
                   ├─ deduplicate into ChangeSet
-                  └─ partial sync: only affected tables
+                  └─ partial sync: always override (drop + register)
 ```
+
+**Note:** Event-driven sync always overrides destination tables without comparison. Events indicate a change occurred, so we apply the change directly (drop + register). This is more efficient than comparing when the change rate is high.
 
 ## Configuration Reference
 
@@ -234,6 +241,33 @@ That's it. On first run, iceberg-catalog-sync creates these objects in the same 
 
 All names are derived from `source_table`, prefixed with `__ics_` to signal internal/private objects. All `CREATE` statements use `IF NOT EXISTS` — idempotent across runs.
 
+### Initial Run Behavior
+
+On the first run (when the subscription doesn't exist yet):
+1. `setup_risingwave()` detects subscription doesn't exist → `is_initial_run = true`
+2. Drops progress table if exists (clean slate)
+3. Creates all RisingWave objects (MV, subscription, progress table)
+4. **Runs a full sync** to establish the baseline in the destination catalog
+5. `consume_events()` — cursor starts from `SINCE begin()` (oldest data in retention window)
+
+This ensures the destination catalog is fully synchronized before incremental event-driven sync begins. The full sync establishes the baseline, and the subscription then captures ongoing changes.
+
+### Retention Configuration
+
+The `retention` setting (default: `"1 day"`) controls how long RisingWave retains changelog history for the subscription. This is set **only at subscription creation time**.
+
+**Important:** RisingWave does not support `ALTER SUBSCRIPTION`. To change retention:
+1. Manually drop the subscription: `DROP SUBSCRIPTION __ics_lakekeeper_events_raw_sub;`
+2. Update `events.risingwave.retention` in your config file
+3. Run a **full sync** first (the new subscription has no history before its creation point)
+4. Resume event-driven mode
+
+```yaml
+events:
+  risingwave:
+    retention: "7 days"  # Set at creation time only
+```
+
 ### Lakekeeper Setup
 
 Configure Lakekeeper to publish to the webhook endpoint:
@@ -256,9 +290,15 @@ Each CloudEvent is flattened into a JSON object with these fields (used by the s
 
 ### Cursor Tracking
 
-The sync tool tracks its position using `rw_timestamp` values, stored in the progress table in RisingWave itself. This keeps iceberg-catalog-sync stateless — no local files needed.
+The sync tool tracks its position using `rw_timestamp` values (Unix milliseconds), stored in the progress table in RisingWave itself. This keeps iceberg-catalog-sync stateless — no local files needed.
 
 The cursor is advanced **only after a successful sync**. If sync fails, the cursor stays where it was and events will be re-processed on the next run (at-least-once semantics). Since the sync is idempotent, reprocessing is safe.
+
+**Cursor syntax:** The subscription cursor uses RisingWave's `SINCE` clause:
+- `SINCE <unix_ms>` — resume from a specific timestamp (used when restarting)
+- `SINCE begin()` — start from oldest available data (used on initial run or no saved cursor)
+- `SINCE now()` — start from declaration time (not used by this tool)
+- `FULL` — read existing snapshot first, then incremental (not used by this tool)
 
 The progress table follows the pattern from the [RisingWave subscription docs](https://docs.risingwave.com/serve/subscription):
 
@@ -280,6 +320,10 @@ from iceberg_catalog_sync import (
     AppConfig,
     ChangeSet,
     SyncResult,
+    setup_risingwave,
+    consume_events,
+    build_changeset_from_rows,
+    save_cursor,
 )
 
 # ── Full sync from config file ──
@@ -304,13 +348,22 @@ config = AppConfig(
 result = sync_catalogs(config)
 
 # ── Event-driven partial sync ──
-from iceberg_catalog_sync.events import build_changeset_from_rows, consume_events, save_cursor
+# Flow: setup → (optional full sync) → consume → sync → save_cursor
 
+is_initial = setup_risingwave(config.events)
+if is_initial:
+    # First run: establish baseline with full sync
+    full_result = sync_catalogs(config)
+    if not full_result.success:
+        raise RuntimeError("Initial full sync failed")
+
+# Consume events (on initial run, gets events after full sync completed)
 rows, latest_ts = consume_events(config.events)
-changeset = build_changeset_from_rows(rows)
-result = sync_from_changeset(config, changeset)
-if result.success and latest_ts is not None:
-    save_cursor(config.events, latest_ts)  # advance cursor only on success
+if rows:
+    changeset = build_changeset_from_rows(rows)
+    result = sync_from_changeset(config, changeset)
+    if result.success and latest_ts is not None:
+        save_cursor(config.events, latest_ts)  # advance cursor only on success
 ```
 
 ## CLI Reference

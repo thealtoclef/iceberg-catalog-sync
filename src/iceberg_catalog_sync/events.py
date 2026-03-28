@@ -15,6 +15,18 @@ manages all other RisingWave objects:
 
 All derived from the single ``source_table`` config input, prefixed with
 ``__ics_`` to signal internal/private objects.
+
+Usage
+-----
+The flow is split into two phases:
+
+1. setup_risingwave() - Creates objects, returns is_initial_run
+2. If initial run: run full sync first (establishes baseline)
+3. consume_events() - Fetch events (after full sync, so events are fresh)
+4. sync_from_changeset() - Apply changes
+5. save_cursor() - Advance cursor only on success
+
+This ensures events consumed are always after the last successful sync.
 """
 
 from __future__ import annotations
@@ -191,6 +203,8 @@ def _ensure_risingwave_objects(conn, rw: RisingWaveConfig) -> None:
     Idempotent — safe to call on every run. Retention is set at subscription
     creation time. If the subscription already exists with a different
     retention, it is left unchanged (ALTER is not supported by RisingWave).
+
+    To change retention, manually drop the subscription and re-run.
     """
     from psycopg2 import sql
 
@@ -276,15 +290,72 @@ def save_cursor(config: EventsConfig, timestamp: int) -> None:
         conn.close()
 
 
+def _subscription_exists(conn, rw: RisingWaveConfig) -> bool:
+    """Check if the subscription exists in RisingWave."""
+    from psycopg2 import sql
+
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL(
+            "SELECT 1 FROM rw_catalog.rw_subscriptions s "
+            "JOIN rw_catalog.rw_schemas sc ON s.schema_id = sc.id "
+            "WHERE s.name = %s AND sc.name = %s "
+            "LIMIT 1"
+        ), (rw.subscription_name, rw.schema_name))
+        result = cur.fetchone()
+    return result is not None
+
+
+def _drop_progress_table(conn, rw: RisingWaveConfig) -> None:
+    """Drop the progress table if it exists. Used on initial run to reset state."""
+    from psycopg2 import sql
+
+    q_progress = _qualified(rw.schema_name, rw.progress_table)
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL(
+            "DROP TABLE IF EXISTS {}"
+        ).format(q_progress))
+    logger.debug("Dropped progress table %s", rw.progress_table)
+
+
+def setup_risingwave(config: EventsConfig) -> bool:
+    """Set up RisingWave objects and return whether this is the initial run.
+
+    Creates MV, subscription, and progress table if they don't exist.
+    On initial run (subscription doesn't exist), drops progress table first
+    to ensure clean state.
+
+    Returns:
+        is_initial_run: True if subscription was just created (needs full sync first)
+    """
+    conn = _connect(config)
+    rw = config.risingwave
+
+    try:
+        # Check if subscription exists BEFORE ensuring objects
+        is_initial_run = not _subscription_exists(conn, rw)
+
+        # Initial run: drop progress table first, then _ensure_risingwave_objects recreates it
+        if is_initial_run:
+            _drop_progress_table(conn, rw)
+
+        # Creates MV, subscription, and progress table (idempotent)
+        _ensure_risingwave_objects(conn, rw)
+
+        return is_initial_run
+    finally:
+        conn.close()
+
+
 def consume_events(config: EventsConfig) -> tuple[list[dict], int | None]:
     """Consume pending events from a RisingWave subscription.
 
-    Connects via psycopg2, ensures all RisingWave objects exist (MV,
-    subscription, progress table), reads the cursor, declares a
-    subscription cursor SINCE that point, and fetches pending events.
+    Connects via psycopg2, reads the cursor, declares a subscription cursor
+    SINCE that point, and fetches pending events.
 
-    Returns (rows, latest_rw_timestamp). Does NOT advance the cursor —
-    the caller must call save_cursor() after successful sync.
+    Assumes setup_risingwave() has already been called.
+
+    Returns (rows, latest_rw_timestamp).
+    Does NOT advance the cursor — caller must call save_cursor() after successful sync.
     """
     from psycopg2 import sql
 
@@ -293,7 +364,6 @@ def consume_events(config: EventsConfig) -> tuple[list[dict], int | None]:
     q_sub = _qualified(rw.schema_name, rw.subscription_name)
 
     try:
-        _ensure_risingwave_objects(conn, rw)
         last_ts = _read_cursor(conn, rw)
 
         cur = conn.cursor()
@@ -304,10 +374,11 @@ def consume_events(config: EventsConfig) -> tuple[list[dict], int | None]:
             ).format(q_sub), (last_ts,))
             logger.info("Resuming from rw_timestamp=%d", last_ts)
         else:
+            # No cursor = start from begin() (oldest data in retention window)
             cur.execute(sql.SQL(
-                "DECLARE ics_cursor SUBSCRIPTION CURSOR FOR {}"
+                "DECLARE ics_cursor SUBSCRIPTION CURSOR FOR {} SINCE BEGIN()"
             ).format(q_sub))
-            logger.info("No cursor found, starting from current position")
+            logger.info("No cursor found, starting from begin()")
 
         all_rows: list[dict] = []
         latest_timestamp: int | None = None

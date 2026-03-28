@@ -52,9 +52,28 @@ def main(config_path: str, mode: str | None) -> None:
             build_changeset_from_rows,
             consume_events,
             save_cursor,
+            setup_risingwave,
         )
 
+        is_initial_run = setup_risingwave(config.events)
+
+        # On initial run: run full sync FIRST to establish baseline
+        if is_initial_run:
+            click.echo("Initial run: running full sync first to establish baseline...")
+            full_result = sync_catalogs(config)
+            click.echo(f"Full sync complete: {full_result.summary}")
+
+            if not full_result.success:
+                click.echo(
+                    f"Full sync had {len(full_result.errors)} error(s). "
+                    "Event mode aborted — fix errors and re-run.",
+                    err=True,
+                )
+                sys.exit(1)
+
+        # Now consume events (on initial run, this gets events after full sync completed)
         rows, latest_ts = consume_events(config.events)
+
         if not rows:
             click.echo("No pending events, nothing to sync.")
             return

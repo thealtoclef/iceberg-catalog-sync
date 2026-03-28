@@ -131,7 +131,16 @@ class TestCLI:
         """)
         )
 
-        with patch("iceberg_catalog_sync.events.consume_events", return_value=([], None)):
+        mock_events = {
+            "setup_risingwave": lambda config: False,
+            "consume_events": lambda config: ([], None),
+            "build_changeset_from_rows": lambda rows, exclude_namespaces=None: type(
+                "MockChangeSet", (), {"is_empty": True, "raw_event_count": 0}
+            )(),
+            "save_cursor": lambda config, ts: None,
+        }
+
+        with patch.dict("sys.modules", {"iceberg_catalog_sync.events": type("MockEvents", (), mock_events)}):
             runner = CliRunner()
             result = runner.invoke(main, ["--config", str(config_file), "--mode", "events"])
             assert result.exit_code == 0
@@ -162,12 +171,124 @@ class TestCLI:
             errors=[SyncError(namespace="ns1", table="t1", error="boom")]
         )
 
+        mock_events = {
+            "setup_risingwave": lambda config: False,
+            "consume_events": lambda config: (rows, 100),
+            "build_changeset_from_rows": lambda rows, exclude_namespaces=None: type(
+                "MockChangeSet", (), {
+                    "is_empty": False,
+                    "affected_namespaces": {"ns1"},
+                    "affected_tables": lambda ns: {"t1"},
+                }
+            )(),
+            "save_cursor": lambda config, ts: None,
+        }
+
         with (
-            patch("iceberg_catalog_sync.events.consume_events", return_value=(rows, 100)),
             patch("iceberg_catalog_sync.cli.sync_from_changeset", return_value=failed_result),
-            patch("iceberg_catalog_sync.events.save_cursor") as mock_save,
+            patch.dict("sys.modules", {"iceberg_catalog_sync.events": type("MockEvents", (), mock_events)}),
+        ):
+            mock_module = __import__("iceberg_catalog_sync.events")
+            with patch.object(mock_module.events, "save_cursor") as mock_save:
+                runner = CliRunner()
+                result = runner.invoke(main, ["--config", str(config_file), "--mode", "events"])
+                assert result.exit_code == 1
+                mock_save.assert_not_called()
+
+    def test_events_mode_initial_run_triggers_full_sync(self, tmp_path):
+        """On initial run (subscription doesn't exist), full sync runs first."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            textwrap.dedent("""\
+            catalogs:
+              source:
+                name: src
+                uri: http://src:8181
+                warehouse: wh
+              destination:
+                name: dst
+                uri: http://dst:8181
+                warehouse: wh
+            events:
+              enabled: true
+        """)
+        )
+
+        rows = [{"op": "Insert", "type": "createTable", "namespace": "ns1",
+                 "name": "t1", "rw_timestamp": 100}]
+        full_result = SyncResult()
+        partial_result = SyncResult()
+
+        mock_events = {
+            "setup_risingwave": lambda config: True,
+            "consume_events": lambda config: (rows, 100),
+            "build_changeset_from_rows": lambda rows, exclude_namespaces=None: type(
+                "MockChangeSet", (), {
+                    "is_empty": False,
+                    "affected_namespaces": {"ns1"},
+                    "affected_tables": lambda ns: {"t1"},
+                }
+            )(),
+            "save_cursor": lambda config, ts: None,
+        }
+
+        with (
+            patch("iceberg_catalog_sync.cli.sync_catalogs", return_value=full_result) as mock_full,
+            patch("iceberg_catalog_sync.cli.sync_from_changeset", return_value=partial_result),
+            patch.dict("sys.modules", {"iceberg_catalog_sync.events": type("MockEvents", (), mock_events)}),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(main, ["--config", str(config_file), "--mode", "events"])
+            assert result.exit_code == 0
+            mock_full.assert_called_once()
+            assert "initial run" in result.output.lower()
+            assert "full sync" in result.output.lower()
+
+    def test_events_mode_initial_run_full_sync_failure_aborts(self, tmp_path):
+        """If full sync fails on initial run, event mode is aborted."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            textwrap.dedent("""\
+            catalogs:
+              source:
+                name: src
+                uri: http://src:8181
+                warehouse: wh
+              destination:
+                name: dst
+                uri: http://dst:8181
+                warehouse: wh
+            events:
+              enabled: true
+        """)
+        )
+
+        rows = [{"op": "Insert", "type": "createTable", "namespace": "ns1",
+                 "name": "t1", "rw_timestamp": 100}]
+        failed_full_result = SyncResult(
+            errors=[SyncError(namespace="ns1", table="t1", error="initial sync failed")]
+        )
+
+        mock_events = {
+            "setup_risingwave": lambda config: True,
+            "consume_events": lambda config: (rows, 100),
+            "build_changeset_from_rows": lambda rows, exclude_namespaces=None: type(
+                "MockChangeSet", (), {
+                    "is_empty": False,
+                    "affected_namespaces": {"ns1"},
+                    "affected_tables": lambda ns: {"t1"},
+                }
+            )(),
+            "save_cursor": lambda config, ts: None,
+        }
+
+        with (
+            patch("iceberg_catalog_sync.cli.sync_catalogs", return_value=failed_full_result),
+            patch("iceberg_catalog_sync.cli.sync_from_changeset") as mock_partial,
+            patch.dict("sys.modules", {"iceberg_catalog_sync.events": type("MockEvents", (), mock_events)}),
         ):
             runner = CliRunner()
             result = runner.invoke(main, ["--config", str(config_file), "--mode", "events"])
             assert result.exit_code == 1
-            mock_save.assert_not_called()
+            mock_partial.assert_not_called()
+            assert "aborted" in result.output.lower()

@@ -191,9 +191,8 @@ def sync_catalogs(config: AppConfig) -> SyncResult:
 def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
     """Run a partial sync — only sync tables/namespaces identified by the ChangeSet.
 
-    Instead of listing all tables in each namespace (expensive), this loads
-    and compares only the specific tables that changed according to events.
-    This dramatically reduces API calls to both source and destination catalogs.
+    Event-driven sync: always overrides destination tables without comparison.
+    Events indicate a change occurred, so we apply the change directly.
     """
     tracer, counters, retry_decorator = _setup_sync(config)
 
@@ -238,10 +237,10 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
                     )
                     continue
 
-                # Sync only the specific tables from the changeset
+                # Sync only the specific tables from the changeset (always override)
                 for table_name in changeset.affected_tables(namespace_str):
                     try:
-                        _sync_single_table(
+                        _sync_single_table_event(
                             source=source,
                             dest=dest,
                             namespace=namespace,
@@ -254,7 +253,6 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
                             tables_registered=counters["tables_registered"],
                             tables_updated=counters["tables_updated"],
                             tables_dropped=counters["tables_dropped"],
-                            tables_up_to_date=counters["tables_up_to_date"],
                             tables_errors=counters["tables_errors"],
                         )
                     except Exception as exc:
@@ -407,6 +405,118 @@ def _sync_single_table(
             namespace_str,
             table_name,
         )
+
+
+def _sync_single_table_event(
+    *,
+    source: Catalog,
+    dest: Catalog,
+    namespace: tuple[str, ...],
+    namespace_str: str,
+    table_name: str,
+    config: AppConfig,
+    result: SyncResult,
+    tracer,
+    retry_decorator,
+    tables_registered,
+    tables_updated,
+    tables_dropped,
+    tables_errors,
+) -> None:
+    """Sync a single table from event — always overrides destination without comparison.
+
+    Event-driven sync: events indicate a change occurred, so we apply the change
+    directly without comparing metadata_location. This avoids unnecessary dest API calls.
+
+    - Table exists in source → drop (if exists) + register from source
+    - Table gone from source → drop from dest (if drop_orphan_tables enabled)
+    """
+    table_id = (*namespace, table_name)
+
+    # Load table from source to get metadata_location
+    source_table: Table | None = None
+    try:
+        source_table = source.load_table(table_id)
+    except NoSuchTableError:
+        pass
+    except Exception as exc:
+        logger.error("Failed to load source table %s.%s: %s", namespace_str, table_name, exc)
+        result.errors.append(
+            SyncError(namespace=namespace_str, table=table_name, error=str(exc))
+        )
+        tables_errors.add(1, {"namespace": namespace_str})
+        return
+
+    if source_table is not None:
+        # Table exists in source → always override destination
+        metadata_location = _get_metadata_location(source_table)
+
+        with tracer.start_as_current_span("update_table") as span:
+            span.set_attribute("namespace", namespace_str)
+            span.set_attribute("table_id", table_name)
+            span.set_attribute("metadata_location", metadata_location)
+
+            if config.sync.dry_run:
+                logger.info("[DRY RUN] Would update table %s.%s → %s", namespace_str, table_name, metadata_location)
+                result.actions.append(
+                    SyncAction(
+                        action=ActionType.UPDATE,
+                        namespace=namespace_str,
+                        table=table_name,
+                        metadata_location=metadata_location,
+                        dry_run=True,
+                    )
+                )
+            else:
+                # Drop existing table (ignore if doesn't exist)
+                try:
+                    retry_decorator(dest.drop_table)(table_id)
+                except NoSuchTableError:
+                    pass
+
+                # Register with new metadata location
+                retry_decorator(dest.register_table)(table_id, metadata_location)
+
+                result.actions.append(
+                    SyncAction(
+                        action=ActionType.UPDATE,
+                        namespace=namespace_str,
+                        table=table_name,
+                        metadata_location=metadata_location,
+                    )
+                )
+            tables_updated.add(1, {"namespace": namespace_str})
+
+    elif config.sync.drop_orphan_tables:
+        # Table gone from source → drop from dest
+        with tracer.start_as_current_span("drop_table") as span:
+            span.set_attribute("namespace", namespace_str)
+            span.set_attribute("table_id", table_name)
+
+            if config.sync.dry_run:
+                logger.info("[DRY RUN] Would drop orphan table %s.%s", namespace_str, table_name)
+                result.actions.append(
+                    SyncAction(
+                        action=ActionType.DROP,
+                        namespace=namespace_str,
+                        table=table_name,
+                        dry_run=True,
+                    )
+                )
+            else:
+                try:
+                    retry_decorator(dest.drop_table)(table_id)
+                except NoSuchTableError:
+                    pass
+
+                result.actions.append(
+                    SyncAction(
+                        action=ActionType.DROP,
+                        namespace=namespace_str,
+                        table=table_name,
+                    )
+                )
+            tables_dropped.add(1, {"namespace": namespace_str})
 
 
 def _sync_namespace(
@@ -767,6 +877,18 @@ def _update_table(
     retry_decorator,
     counter,
 ) -> None:
+    """Update a table's metadata location.
+
+    Note: The Iceberg REST catalog doesn't provide an atomic "update metadata location"
+    API for external table registration. This implementation uses drop+register which
+    creates a brief window (milliseconds) where the table doesn't exist.
+
+    The operation is idempotent - if it fails midway, re-running will complete it.
+    Data files are never at risk - only the catalog metadata pointer changes.
+
+    For catalogs that support atomic metadata updates (e.g., those implementing the
+    full Iceberg REST spec with commit_table), consider using a catalog-specific client.
+    """
     table_id = (*namespace, table_name)
     if config.sync.dry_run:
         logger.info(
@@ -786,14 +908,18 @@ def _update_table(
         )
     else:
         logger.info(
-            "Updating table %s.%s -> %s (drop + register)",
+            "Updating table %s.%s -> %s",
             namespace_str,
             table_name,
             metadata_location,
         )
+        # Drop the old table and register the new metadata location.
+        # This is the standard pattern for external table registration in Iceberg REST catalog.
+        # The operation is idempotent - if register fails, re-running will complete it.
         try:
             retry_decorator(dest.drop_table)(table_id)
         except NoSuchTableError:
+            # Table was already dropped (race condition or previous partial run)
             pass
         retry_decorator(dest.register_table)(table_id, metadata_location)
         result.actions.append(
