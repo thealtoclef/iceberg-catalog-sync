@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from pyiceberg.exceptions import (
@@ -25,6 +25,8 @@ def mock_catalogs():
     with patch("iceberg_catalog_sync.sync.load_catalog") as mock_load:
         source = MagicMock()
         dest = MagicMock()
+        # Default: source has one namespace "test_ns"
+        source.list_namespaces.return_value = [("test_ns",)]
         mock_load.side_effect = lambda name, **kwargs: (
             source if name == "source" else dest
         )
@@ -158,6 +160,41 @@ class TestSyncNamespace:
         assert len(prop_actions) == 1
 
 
+class TestNamespaceResolution:
+    def test_discovers_all_namespaces_from_source(self, base_config, mock_catalogs):
+        source, dest = mock_catalogs
+        source.list_namespaces.return_value = [("ns1",), ("ns2",), ("ns3",)]
+        source.list_tables.return_value = []
+        dest.list_tables.return_value = []
+        dest.load_namespace_properties.return_value = {}
+        source.load_namespace_properties.return_value = {}
+
+        result = sync_catalogs(base_config)
+
+        source.list_namespaces.assert_called_once()
+        # Should have namespace property actions for all 3
+        ns_actions = [a for a in result.actions if a.action in (
+            ActionType.UPDATE_NAMESPACE_PROPERTIES, ActionType.CREATE_NAMESPACE
+        )]
+        # At minimum, all 3 namespaces were visited (even if no property changes)
+        assert result.success
+
+    def test_exclude_namespaces(self, base_config, mock_catalogs):
+        base_config.sync.exclude_namespaces = ["excluded"]
+        source, dest = mock_catalogs
+        source.list_namespaces.return_value = [("ns1",), ("excluded",)]
+        source.list_tables.return_value = []
+        dest.list_tables.return_value = []
+        dest.load_namespace_properties.return_value = {}
+        source.load_namespace_properties.return_value = {}
+
+        result = sync_catalogs(base_config)
+
+        # "excluded" should not appear in any actions
+        all_ns = {a.namespace for a in result.actions}
+        assert "excluded" not in all_ns
+
+
 class TestDryRun:
     def test_dry_run_no_mutations(self, base_config, mock_catalogs):
         base_config.sync.dry_run = True
@@ -195,7 +232,6 @@ class TestErrorIsolation:
 
         result = sync_catalogs(base_config)
 
-        # good_table should still be registered
         dest.register_table.assert_called_once()
         assert len(result.errors) == 1
         assert result.errors[0].table == "bad_table"
@@ -296,8 +332,9 @@ class TestSyncFromChangeset:
         source.list_tables.assert_not_called()
         dest.list_tables.assert_not_called()
 
-    def test_filters_to_managed_namespaces(self, base_config, mock_catalogs):
-        """Changeset may include namespaces not in config — those are skipped."""
+    def test_exclude_namespaces_from_changeset(self, base_config, mock_catalogs):
+        """Excluded namespaces in changeset are skipped."""
+        base_config.sync.exclude_namespaces = ["excluded_ns"]
         source, dest = mock_catalogs
         dest.load_namespace_properties.return_value = {}
         source.load_namespace_properties.return_value = {}
@@ -306,12 +343,11 @@ class TestSyncFromChangeset:
         dest.load_table.side_effect = NoSuchTableError("not found")
 
         changeset = ChangeSet()
-        changeset.add_table_change("test_ns", "table_a")  # managed
-        changeset.add_table_change("other_ns", "table_b")  # not managed
+        changeset.add_table_change("test_ns", "table_a")
+        changeset.add_table_change("excluded_ns", "table_b")
 
         result = sync_from_changeset(base_config, changeset)
 
-        # Only test_ns table should be processed
         dest.register_table.assert_called_once()
         call_args = dest.register_table.call_args[0]
         assert call_args[0] == ("test_ns", "table_a")

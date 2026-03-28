@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-risingwave = ["risingwave-py"]
+risingwave = ["psycopg2-binary>=2.9"]
 
 [project.scripts]
 iceberg-catalog-sync = "iceberg_catalog_sync.cli:main"

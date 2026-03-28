@@ -51,20 +51,36 @@ def main(config_path: str, mode: str | None) -> None:
         from iceberg_catalog_sync.events import (
             build_changeset_from_rows,
             consume_events,
+            save_cursor,
         )
 
-        rows, _ = consume_events(config.events)
+        rows, latest_ts = consume_events(config.events)
         if not rows:
             click.echo("No pending events, nothing to sync.")
             return
 
-        managed = set(config.sync.namespaces)
-        changeset = build_changeset_from_rows(rows, managed)
+        exclude = set(config.sync.exclude_namespaces)
+        changeset = build_changeset_from_rows(
+            rows, exclude_namespaces=exclude or None
+        )
         if changeset.is_empty:
             click.echo("No relevant changes in events, nothing to sync.")
+            # Still advance cursor — these events were consumed but irrelevant
+            if latest_ts is not None:
+                save_cursor(config.events, latest_ts)
             return
 
         result = sync_from_changeset(config, changeset)
+
+        # Advance cursor ONLY after successful sync
+        if result.success and latest_ts is not None:
+            save_cursor(config.events, latest_ts)
+        elif not result.success and latest_ts is not None:
+            click.echo(
+                "Sync had errors — cursor NOT advanced. "
+                "Events will be re-processed on next run.",
+                err=True,
+            )
     else:
         result = sync_catalogs(config)
 

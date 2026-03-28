@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from iceberg_catalog_sync.config import AppConfig, LogConfig, load_config
+from iceberg_catalog_sync.config import AppConfig, LogConfig, RisingWaveConfig, load_config
 
 
 class TestLoadConfig:
@@ -24,15 +24,12 @@ class TestLoadConfig:
                 name: dst
                 uri: http://localhost:8182
                 warehouse: wh2
-            sync:
-              namespaces:
-                - my_db
         """)
         )
         config = load_config(str(config_file))
         assert config.catalogs.source.name == "src"
         assert config.catalogs.destination.uri == "http://localhost:8182"
-        assert config.sync.namespaces == ["my_db"]
+        assert config.sync.exclude_namespaces == []
         assert config.sync.dry_run is False
         assert config.retry.max_attempts == 5
 
@@ -50,8 +47,6 @@ class TestLoadConfig:
                 name: dst
                 uri: http://dest:8181
                 warehouse: wh
-            sync:
-              namespaces: [db1]
         """)
         )
         config = load_config(str(config_file))
@@ -70,11 +65,8 @@ class TestLoadConfig:
                 name: dst
                 uri: http://dest:8181
                 warehouse: wh
-            sync:
-              namespaces: [db1]
         """)
         )
-        # Ensure the var is not set
         os.environ.pop("NONEXISTENT_VAR", None)
         config = load_config(str(config_file))
         assert config.catalogs.source.uri == "http://default:8181"
@@ -92,8 +84,6 @@ class TestLoadConfig:
                 name: dst
                 uri: http://dest:8181
                 warehouse: wh
-            sync:
-              namespaces: [db1]
         """)
         )
         os.environ.pop("MISSING_REQUIRED_VAR", None)
@@ -116,7 +106,7 @@ class TestLoadConfig:
                 uri: http://dst:8181
                 warehouse: wh2
             sync:
-              namespaces: [db1, db2]
+              exclude_namespaces: [system]
               dry_run: true
               drop_orphan_tables: true
               sync_namespace_properties: false
@@ -135,8 +125,9 @@ class TestLoadConfig:
                 user: myuser
                 password: mypass
                 database: mydb
-                subscription_name: my_sub
-                cursor_path: /tmp/cursor.json
+                schema_name: analytics
+                source_table: my_events_raw
+              sync_interval_seconds: 30
               max_events: 500
             metrics:
               enabled: true
@@ -151,14 +142,43 @@ class TestLoadConfig:
         assert config.catalogs.source.properties == {"token": "abc123"}
         assert config.sync.dry_run is True
         assert config.sync.drop_orphan_tables is True
+        assert config.sync.exclude_namespaces == ["system"]
         assert config.retry.max_attempts == 10
         assert config.log.format == "json"
         assert config.events.enabled is True
-        assert config.events.risingwave.host == "rw.example.com"
-        assert config.events.risingwave.subscription_name == "my_sub"
+        rw = config.events.risingwave
+        assert rw.host == "rw.example.com"
+        assert rw.schema_name == "analytics"
+        assert rw.source_table == "my_events_raw"
+        assert rw.mv_name == "__ics_my_events_raw_mv"
+        assert rw.subscription_name == "__ics_my_events_raw_sub"
+        assert rw.progress_table == "__ics_my_events_raw_progress"
+        assert config.events.sync_interval_seconds == 30
         assert config.events.max_events == 500
         assert config.metrics.enabled is True
         assert config.tracing.service_name == "my-sync"
+
+
+class TestRisingWaveConfig:
+    def test_derived_names_default(self):
+        rw = RisingWaveConfig()
+        assert rw.mv_name == "__ics_lakekeeper_events_raw_mv"
+        assert rw.subscription_name == "__ics_lakekeeper_events_raw_sub"
+        assert rw.progress_table == "__ics_lakekeeper_events_raw_progress"
+
+    def test_derived_names_custom(self):
+        rw = RisingWaveConfig(source_table="my_webhook")
+        assert rw.mv_name == "__ics_my_webhook_mv"
+        assert rw.subscription_name == "__ics_my_webhook_sub"
+        assert rw.progress_table == "__ics_my_webhook_progress"
+
+    def test_retention_default(self):
+        rw = RisingWaveConfig()
+        assert rw.retention == "1 day"
+
+    def test_retention_custom(self):
+        rw = RisingWaveConfig(retention="7 days")
+        assert rw.retention == "7 days"
 
 
 class TestLogConfig:

@@ -53,9 +53,8 @@ catalogs:
       token: ${DEST_TOKEN}
 
 sync:
-  namespaces:
-    - my_database
-    - another_db
+  exclude_namespaces:           # Optional: skip these namespaces
+    - system
   dry_run: false
   drop_orphan_tables: false
   sync_namespace_properties: true
@@ -154,9 +153,7 @@ catalogs:
 
 # ─── Sync behavior ───
 sync:
-  namespaces:                    # Namespaces to sync (required)
-    - my_database
-    - another_db
+  exclude_namespaces: [system]   # Skip these namespaces (default: none)
   dry_run: false                 # Preview changes without mutating destination
   drop_orphan_tables: false      # Drop tables in dest that don't exist in source
   sync_namespace_properties: true  # Sync namespace properties (additive only)
@@ -181,8 +178,13 @@ events:
     user: root
     password: ${RW_PASSWORD:-root}
     database: dev
-    subscription_name: lakekeeper_events_subscription
-    cursor_path: .iceberg-catalog-sync-cursor.json  # Offset tracking file
+    schema_name: public                        # Schema for all managed objects
+    source_table: lakekeeper_events_raw        # Webhook source table (must already exist)
+    # Derived objects (auto-created in same database/schema):
+    #   MV:        __ics_lakekeeper_events_raw_mv
+    #   Sub:       __ics_lakekeeper_events_raw_sub
+    #   Progress:  __ics_lakekeeper_events_raw_progress
+  sync_interval_seconds: 60      # Batch window — events are collected and synced as one batch
   max_events: 1000               # Max events to process per run
 
 # ─── OpenTelemetry Metrics ───
@@ -210,7 +212,9 @@ tracing:
 
 Lakekeeper publishes CloudEvents to RisingWave's built-in [webhook source](https://docs.risingwave.com/integrations/sources/webhook), which is embedded in the RisingWave frontend node — no extra services to deploy. The webhook uses RisingWave's FastInsert RPC path (bypasses SQL parser), and `wait_for_persistence=true` by default means HTTP 200 = data durably committed.
 
-**Step 1: Create the webhook source table** (single JSONB column):
+The only prerequisite is the webhook source table. **All other objects are auto-created by iceberg-catalog-sync on first run.**
+
+**Create the webhook source table** (single JSONB column):
 
 ```sql
 CREATE TABLE lakekeeper_events_raw (
@@ -220,34 +224,15 @@ CREATE TABLE lakekeeper_events_raw (
 );
 ```
 
-**Step 2: Create a materialized view** to flatten JSONB into typed columns:
+That's it. On first run, iceberg-catalog-sync creates these objects in the same database and schema:
 
-```sql
-CREATE MATERIALIZED VIEW lakekeeper_events AS
-SELECT
-    data ->> 'id'           AS id,
-    data ->> 'type'         AS type,
-    data ->> 'source'       AS source,
-    data ->> 'namespace'    AS namespace,
-    data ->> 'name'         AS name,
-    data ->> 'tabular_id'   AS tabular_id,
-    data ->> 'warehouse_id' AS warehouse_id,
-    data ->> 'trace_id'     AS trace_id,
-    (data -> 'data')::JSONB AS data
-FROM lakekeeper_events_raw;
-```
+| Object | Name | Purpose |
+|--------|------|---------|
+| Materialized View | `__ics_lakekeeper_events_raw_mv` | Flattens JSONB into typed columns |
+| Subscription | `__ics_lakekeeper_events_raw_sub` | Change feed from the MV |
+| Progress Table | `__ics_lakekeeper_events_raw_progress` | Cursor tracking (single-row, `ON CONFLICT OVERWRITE`) |
 
-The MV is incrementally maintained — RisingWave only processes new rows as they arrive.
-
-**Step 3: Create the subscription:**
-
-```sql
-CREATE SUBSCRIPTION lakekeeper_events_subscription
-    FROM lakekeeper_events
-    WITH (retention = '7 days');
-```
-
-The `retention` parameter controls how long consumed events are kept. Adjust based on your consumer's recovery window.
+All names are derived from `source_table`, prefixed with `__ics_` to signal internal/private objects. All `CREATE` statements use `IF NOT EXISTS` — idempotent across runs.
 
 ### Lakekeeper Setup
 
@@ -271,9 +256,17 @@ Each CloudEvent is flattened into a JSON object with these fields (used by the s
 
 ### Cursor Tracking
 
-The sync tool tracks its position in the RisingWave subscription using `rw_timestamp` values, stored in a local JSON file (configurable via `cursor_path`). This ensures exactly-once processing across cron runs.
+The sync tool tracks its position using `rw_timestamp` values, stored in the progress table in RisingWave itself. This keeps iceberg-catalog-sync stateless — no local files needed.
 
-On first run (or if the cursor file is missing), consumption starts from `begin()` (oldest available data). Subsequent runs resume from the last processed timestamp.
+The cursor is advanced **only after a successful sync**. If sync fails, the cursor stays where it was and events will be re-processed on the next run (at-least-once semantics). Since the sync is idempotent, reprocessing is safe.
+
+The progress table follows the pattern from the [RisingWave subscription docs](https://docs.risingwave.com/serve/subscription):
+
+```sql
+CREATE TABLE IF NOT EXISTS __ics_lakekeeper_events_raw_progress (
+    progress BIGINT PRIMARY KEY
+) ON CONFLICT OVERWRITE;
+```
 
 ## Library API
 
@@ -306,16 +299,18 @@ config = AppConfig(
         source=CatalogConfig(name="src", uri="http://...", warehouse="wh"),
         destination=CatalogConfig(name="dst", uri="http://...", warehouse="wh"),
     ),
-    sync=SyncBehaviorConfig(namespaces=["my_db"]),
+    sync=SyncBehaviorConfig(),  # syncs all source namespaces by default
 )
 result = sync_catalogs(config)
 
 # ── Event-driven partial sync ──
-from iceberg_catalog_sync.events import build_changeset_from_rows, consume_events
+from iceberg_catalog_sync.events import build_changeset_from_rows, consume_events, save_cursor
 
-rows, _ = consume_events(config.events)
-changeset = build_changeset_from_rows(rows, managed_namespaces={"my_db"})
+rows, latest_ts = consume_events(config.events)
+changeset = build_changeset_from_rows(rows)
 result = sync_from_changeset(config, changeset)
+if result.success and latest_ts is not None:
+    save_cursor(config.events, latest_ts)  # advance cursor only on success
 ```
 
 ## CLI Reference

@@ -23,7 +23,7 @@ class CatalogsConfig(BaseModel):
 
 
 class SyncBehaviorConfig(BaseModel):
-    namespaces: list[str]
+    exclude_namespaces: list[str] = Field(default_factory=list)
     dry_run: bool = False
     drop_orphan_tables: bool = False
     sync_namespace_properties: bool = True
@@ -74,13 +74,27 @@ class RisingWaveConfig(BaseModel):
     user: str = "root"
     password: str = "root"
     database: str = "dev"
-    subscription_name: str = "lakekeeper_events_subscription"
-    cursor_path: str = ".iceberg-catalog-sync-cursor.json"
+    schema_name: str = "public"
+    source_table: str = "lakekeeper_events_raw"
+    retention: str = "1 day"
+
+    @property
+    def mv_name(self) -> str:
+        return f"__ics_{self.source_table}_mv"
+
+    @property
+    def subscription_name(self) -> str:
+        return f"__ics_{self.source_table}_sub"
+
+    @property
+    def progress_table(self) -> str:
+        return f"__ics_{self.source_table}_progress"
 
 
 class EventsConfig(BaseModel):
     enabled: bool = False
     risingwave: RisingWaveConfig = RisingWaveConfig()
+    sync_interval_seconds: int = 60
     max_events: int = 1000
 
 
@@ -88,7 +102,7 @@ class AppConfig(BaseModel):
     """Root config — maps 1:1 to YAML structure."""
 
     catalogs: CatalogsConfig
-    sync: SyncBehaviorConfig
+    sync: SyncBehaviorConfig = SyncBehaviorConfig()
     retry: RetryConfig = RetryConfig()
     log: LogConfig = LogConfig()
     events: EventsConfig = EventsConfig()

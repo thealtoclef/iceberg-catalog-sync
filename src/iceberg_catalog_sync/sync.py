@@ -49,45 +49,74 @@ def _get_metadata_location(table: Table) -> str:
     return table.metadata_location
 
 
+def _resolve_namespaces(source: Catalog, config: AppConfig) -> list[str]:
+    """Discover all namespaces from the source catalog, minus exclusions."""
+    exclude = set(config.sync.exclude_namespaces)
+
+    raw = source.list_namespaces()
+    ns_list = [".".join(ns) for ns in raw]
+    logger.info("Discovered %d namespaces from source catalog", len(ns_list))
+
+    if exclude:
+        ns_list = [ns for ns in ns_list if ns not in exclude]
+        logger.debug("After exclusions: %d namespaces", len(ns_list))
+
+    return ns_list
+
+
+def _setup_sync(config: AppConfig):
+    """Common setup for both sync modes. Returns (tracer, meter, retry_decorator, counters)."""
+    setup_logging(config.log)
+    tracer = setup_tracing(config.tracing)
+    meter = setup_metrics(config.metrics)
+
+    counters = {
+        "tables_registered": meter.create_counter(
+            "sync.tables.registered",
+            description="Tables newly registered in destination",
+        ),
+        "tables_updated": meter.create_counter(
+            "sync.tables.updated",
+            description="Tables with updated metadata location",
+        ),
+        "tables_dropped": meter.create_counter(
+            "sync.tables.dropped",
+            description="Orphan tables dropped from destination",
+        ),
+        "tables_up_to_date": meter.create_counter(
+            "sync.tables.up_to_date",
+            description="Tables already in sync",
+        ),
+        "tables_errors": meter.create_counter(
+            "sync.tables.errors",
+            description="Per-table sync failures",
+        ),
+        "namespaces_created": meter.create_counter(
+            "sync.namespaces.created",
+            description="Namespaces created in destination",
+        ),
+        "sync_duration": meter.create_histogram(
+            "sync.duration_seconds",
+            description="Total sync duration",
+        ),
+    }
+
+    retries_counter = meter.create_counter(
+        "sync.retries", description="Retry attempts due to rate limits"
+    )
+    retry_decorator = make_retry_decorator(
+        config.retry, retries_counter=retries_counter
+    )
+
+    return tracer, counters, retry_decorator
+
+
 def sync_catalogs(config: AppConfig) -> SyncResult:
     """Run a full sync between source and destination catalogs.
 
     Stateless and idempotent — safe to restart at any point.
     """
-    setup_logging(config.log)
-    tracer = setup_tracing(config.tracing)
-    meter = setup_metrics(config.metrics)
-
-    # Set up metrics counters
-    tables_registered = meter.create_counter(
-        "sync.tables.registered", description="Tables newly registered in destination"
-    )
-    tables_updated = meter.create_counter(
-        "sync.tables.updated",
-        description="Tables with updated metadata location",
-    )
-    tables_dropped = meter.create_counter(
-        "sync.tables.dropped", description="Orphan tables dropped from destination"
-    )
-    tables_up_to_date = meter.create_counter(
-        "sync.tables.up_to_date", description="Tables already in sync"
-    )
-    tables_errors = meter.create_counter(
-        "sync.tables.errors", description="Per-table sync failures"
-    )
-    namespaces_created = meter.create_counter(
-        "sync.namespaces.created", description="Namespaces created in destination"
-    )
-    sync_duration = meter.create_histogram(
-        "sync.duration_seconds", description="Total sync duration"
-    )
-    retries_counter = meter.create_counter(
-        "sync.retries", description="Retry attempts due to rate limits"
-    )
-
-    retry_decorator = make_retry_decorator(
-        config.retry, retries_counter=retries_counter
-    )
+    tracer, counters, retry_decorator = _setup_sync(config)
 
     result = SyncResult(dry_run=config.sync.dry_run)
     start_time = time.monotonic()
@@ -97,8 +126,9 @@ def sync_catalogs(config: AppConfig) -> SyncResult:
 
         source = _make_catalog(config.catalogs.source)
         dest = _make_catalog(config.catalogs.destination)
+        namespaces = _resolve_namespaces(source, config)
 
-        for namespace_str in config.sync.namespaces:
+        for namespace_str in namespaces:
             namespace = tuple(namespace_str.split("."))
             with tracer.start_as_current_span(
                 f"sync_namespace({namespace_str})"
@@ -114,7 +144,7 @@ def sync_catalogs(config: AppConfig) -> SyncResult:
                         config=config,
                         result=result,
                         retry_decorator=retry_decorator,
-                        namespaces_created=namespaces_created,
+                        namespaces_created=counters["namespaces_created"],
                     )
                 except Exception as exc:
                     logger.error(
@@ -136,11 +166,11 @@ def sync_catalogs(config: AppConfig) -> SyncResult:
                         result=result,
                         tracer=tracer,
                         retry_decorator=retry_decorator,
-                        tables_registered=tables_registered,
-                        tables_updated=tables_updated,
-                        tables_dropped=tables_dropped,
-                        tables_up_to_date=tables_up_to_date,
-                        tables_errors=tables_errors,
+                        tables_registered=counters["tables_registered"],
+                        tables_updated=counters["tables_updated"],
+                        tables_dropped=counters["tables_dropped"],
+                        tables_up_to_date=counters["tables_up_to_date"],
+                        tables_errors=counters["tables_errors"],
                     )
                 except Exception as exc:
                     logger.error(
@@ -153,7 +183,7 @@ def sync_catalogs(config: AppConfig) -> SyncResult:
                     )
 
     elapsed = time.monotonic() - start_time
-    sync_duration.record(elapsed)
+    counters["sync_duration"].record(elapsed)
     logger.info("Sync completed in %.2fs: %s", elapsed, result.summary)
     return result
 
@@ -165,41 +195,10 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
     and compares only the specific tables that changed according to events.
     This dramatically reduces API calls to both source and destination catalogs.
     """
-    setup_logging(config.log)
-    tracer = setup_tracing(config.tracing)
-    meter = setup_metrics(config.metrics)
-
-    tables_registered = meter.create_counter(
-        "sync.tables.registered", description="Tables newly registered in destination"
-    )
-    tables_updated = meter.create_counter(
-        "sync.tables.updated", description="Tables with updated metadata location"
-    )
-    tables_dropped = meter.create_counter(
-        "sync.tables.dropped", description="Orphan tables dropped from destination"
-    )
-    tables_up_to_date = meter.create_counter(
-        "sync.tables.up_to_date", description="Tables already in sync"
-    )
-    tables_errors = meter.create_counter(
-        "sync.tables.errors", description="Per-table sync failures"
-    )
-    namespaces_created = meter.create_counter(
-        "sync.namespaces.created", description="Namespaces created in destination"
-    )
-    sync_duration = meter.create_histogram(
-        "sync.duration_seconds", description="Total sync duration"
-    )
-    retries_counter = meter.create_counter(
-        "sync.retries", description="Retry attempts due to rate limits"
-    )
-
-    retry_decorator = make_retry_decorator(
-        config.retry, retries_counter=retries_counter
-    )
+    tracer, counters, retry_decorator = _setup_sync(config)
 
     result = SyncResult(dry_run=config.sync.dry_run)
-    managed = set(config.sync.namespaces)
+    exclude = set(config.sync.exclude_namespaces)
     start_time = time.monotonic()
 
     with tracer.start_as_current_span("sync_from_changeset") as root_span:
@@ -209,7 +208,10 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
         source = _make_catalog(config.catalogs.source)
         dest = _make_catalog(config.catalogs.destination)
 
-        for namespace_str in changeset.affected_namespaces & managed:
+        # Use changeset namespaces, filtered by exclude list
+        target_namespaces = changeset.affected_namespaces - exclude
+
+        for namespace_str in target_namespaces:
             namespace = tuple(namespace_str.split("."))
             with tracer.start_as_current_span(
                 f"sync_namespace({namespace_str})"
@@ -225,7 +227,7 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
                         config=config,
                         result=result,
                         retry_decorator=retry_decorator,
-                        namespaces_created=namespaces_created,
+                        namespaces_created=counters["namespaces_created"],
                     )
                 except Exception as exc:
                     logger.error(
@@ -249,11 +251,11 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
                             result=result,
                             tracer=tracer,
                             retry_decorator=retry_decorator,
-                            tables_registered=tables_registered,
-                            tables_updated=tables_updated,
-                            tables_dropped=tables_dropped,
-                            tables_up_to_date=tables_up_to_date,
-                            tables_errors=tables_errors,
+                            tables_registered=counters["tables_registered"],
+                            tables_updated=counters["tables_updated"],
+                            tables_dropped=counters["tables_dropped"],
+                            tables_up_to_date=counters["tables_up_to_date"],
+                            tables_errors=counters["tables_errors"],
                         )
                     except Exception as exc:
                         logger.error(
@@ -269,10 +271,10 @@ def sync_from_changeset(config: AppConfig, changeset: ChangeSet) -> SyncResult:
                                 error=str(exc),
                             )
                         )
-                        tables_errors.add(1, {"namespace": namespace_str})
+                        counters["tables_errors"].add(1, {"namespace": namespace_str})
 
     elapsed = time.monotonic() - start_time
-    sync_duration.record(elapsed)
+    counters["sync_duration"].record(elapsed)
     logger.info("Partial sync completed in %.2fs: %s", elapsed, result.summary)
     return result
 

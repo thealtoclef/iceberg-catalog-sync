@@ -1,23 +1,28 @@
 """CloudEvent consumer for event-driven partial sync via RisingWave.
 
-Consumes CloudEvents published by Lakekeeper to RisingWave via its Events API,
-using RisingWave subscriptions with cursor-based consumption. Builds a
-deduplicated ChangeSet of affected namespaces and tables, which is then used
-to trigger a targeted partial sync instead of a full namespace scan.
+Consumes CloudEvents published by Lakekeeper to RisingWave via its webhook
+source. Uses RisingWave subscriptions (cursor-based) per
+https://docs.risingwave.com/serve/subscription to read changes, then builds
+a deduplicated ChangeSet of affected namespaces and tables for partial sync.
 
-Flow:
-  Lakekeeper → (Events API HTTP POST) → RisingWave table → subscription
-  → iceberg-catalog-sync reads subscription via cursor → ChangeSet → partial sync
+Connects to RisingWave via psycopg2 (Postgres wire protocol). The only
+prerequisite is the webhook source table (single JSONB column) — this module
+manages all other RisingWave objects:
+
+  - Materialized view:  __ics_{source_table}_mv       (flattens JSONB)
+  - Subscription:       __ics_{source_table}_sub       (change feed)
+  - Progress table:     __ics_{source_table}_progress  (cursor tracking)
+
+All derived from the single ``source_table`` config input, prefixed with
+``__ics_`` to signal internal/private objects.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from iceberg_catalog_sync.config import EventsConfig
+from iceberg_catalog_sync.config import EventsConfig, RisingWaveConfig
 
 logger = logging.getLogger("iceberg_catalog_sync")
 
@@ -89,12 +94,10 @@ class ChangeSet:
 
 
 def _parse_event_row(
-    row: dict, managed_namespaces: set[str]
+    row: dict,
+    exclude_namespaces: set[str] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Extract (namespace, table_name, event_type) from a RisingWave subscription row.
-
-    The row contains columns from the lakekeeper_events table plus the
-    subscription metadata columns (op, rw_timestamp).
 
     Returns (None, None, None) if the event is not relevant.
     """
@@ -104,8 +107,8 @@ def _parse_event_row(
     if not namespace:
         return None, None, None
 
-    if namespace not in managed_namespaces:
-        logger.debug("Skipping event for unmanaged namespace: %s", namespace)
+    if exclude_namespaces and namespace in exclude_namespaces:
+        logger.debug("Skipping event for excluded namespace: %s", namespace)
         return None, None, None
 
     if event_type in TABLE_EVENT_TYPES:
@@ -122,7 +125,8 @@ def _parse_event_row(
 
 
 def build_changeset_from_rows(
-    rows: list[dict], managed_namespaces: set[str]
+    rows: list[dict],
+    exclude_namespaces: set[str] | None = None,
 ) -> ChangeSet:
     """Build a ChangeSet from RisingWave subscription rows."""
     changeset = ChangeSet()
@@ -134,7 +138,9 @@ def build_changeset_from_rows(
         if op not in ("Insert", "UpdateInsert", 1, 3):
             continue
 
-        namespace, table_name, event_type = _parse_event_row(row, managed_namespaces)
+        namespace, table_name, event_type = _parse_event_row(
+            row, exclude_namespaces=exclude_namespaces
+        )
         if namespace is None:
             continue
         if table_name is not None:
@@ -150,82 +156,170 @@ def build_changeset_from_rows(
     return changeset
 
 
-def _load_cursor_timestamp(cursor_path: str) -> int | None:
-    """Load the last rw_timestamp from the cursor file."""
-    path = Path(cursor_path)
-    if not path.exists():
-        return None
+# ── RisingWave connection and SQL helpers ──
+
+
+def _connect(config: EventsConfig):
+    """Create a psycopg2 connection to RisingWave."""
     try:
-        data = json.loads(path.read_text())
-        return data.get("last_rw_timestamp")
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read cursor file %s: %s", cursor_path, exc)
-        return None
+        import psycopg2
+    except ImportError:
+        raise ImportError(
+            "RisingWave support requires the 'psycopg2' package. "
+            "Install with: pip install psycopg2-binary"
+        ) from None
+
+    rw = config.risingwave
+    return psycopg2.connect(
+        host=rw.host,
+        port=rw.port,
+        user=rw.user,
+        password=rw.password,
+        database=rw.database,
+    )
 
 
-def _save_cursor_timestamp(cursor_path: str, timestamp: int) -> None:
-    """Save the last rw_timestamp to the cursor file."""
-    path = Path(cursor_path)
-    path.write_text(json.dumps({"last_rw_timestamp": timestamp}))
-    logger.debug("Saved cursor timestamp %d to %s", timestamp, cursor_path)
+def _qualified(schema: str, name: str):
+    """Build a schema-qualified identifier: schema.name"""
+    from psycopg2 import sql
+    return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(name))
+
+
+def _ensure_risingwave_objects(conn, rw: RisingWaveConfig) -> None:
+    """Create MV, subscription, and progress table if they do not exist.
+
+    Idempotent — safe to call on every run. Retention is set at subscription
+    creation time. If the subscription already exists with a different
+    retention, it is left unchanged (ALTER is not supported by RisingWave).
+    """
+    from psycopg2 import sql
+
+    q_source = _qualified(rw.schema_name, rw.source_table)
+    q_mv = _qualified(rw.schema_name, rw.mv_name)
+    q_sub = _qualified(rw.schema_name, rw.subscription_name)
+    q_progress = _qualified(rw.schema_name, rw.progress_table)
+
+    with conn.cursor() as cur:
+        # Materialized view: flatten JSONB into typed columns
+        cur.execute(sql.SQL(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {} AS "
+            "SELECT "
+            "  data ->> 'id'           AS id,"
+            "  data ->> 'type'         AS type,"
+            "  data ->> 'source'       AS source,"
+            "  data ->> 'namespace'    AS namespace,"
+            "  data ->> 'name'         AS name,"
+            "  data ->> 'tabular_id'   AS tabular_id,"
+            "  data ->> 'warehouse_id' AS warehouse_id,"
+            "  data ->> 'trace_id'     AS trace_id,"
+            "  (data -> 'data')::JSONB AS data "
+            "FROM {}"
+        ).format(q_mv, q_source))
+
+        # Subscription on the MV
+        cur.execute(sql.SQL(
+            "CREATE SUBSCRIPTION IF NOT EXISTS {} "
+            "FROM {} WITH (retention = %s)"
+        ).format(q_sub, q_mv), (rw.retention,))
+
+        # Progress table: single-row cursor tracking
+        cur.execute(sql.SQL(
+            "CREATE TABLE IF NOT EXISTS {} ("
+            "  progress BIGINT PRIMARY KEY"
+            ") ON CONFLICT OVERWRITE"
+        ).format(q_progress))
+
+    logger.debug(
+        "Ensured RisingWave objects: mv=%s sub=%s progress=%s",
+        rw.mv_name, rw.subscription_name, rw.progress_table,
+    )
+
+
+def _read_cursor(conn, rw: RisingWaveConfig) -> int | None:
+    """Read the current cursor progress."""
+    from psycopg2 import sql
+
+    q_progress = _qualified(rw.schema_name, rw.progress_table)
+    with conn.cursor() as cur:
+        try:
+            cur.execute(sql.SQL("SELECT progress FROM {}").format(q_progress))
+            result = cur.fetchone()
+        except Exception:
+            return None
+    if result and result[0] is not None:
+        return int(result[0])
+    return None
+
+
+def save_cursor(config: EventsConfig, timestamp: int) -> None:
+    """Save cursor progress to RisingWave.
+
+    Call this ONLY after a successful sync. Uses INSERT into a table with
+    ON CONFLICT OVERWRITE — the single row is replaced unconditionally.
+    """
+    from psycopg2 import sql
+
+    conn = _connect(config)
+    try:
+        rw = config.risingwave
+        q_progress = _qualified(rw.schema_name, rw.progress_table)
+        _ensure_risingwave_objects(conn, rw)
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("INSERT INTO {} (progress) VALUES (%s)").format(q_progress),
+                (timestamp,),
+            )
+            cur.execute("FLUSH")
+        conn.commit()
+        logger.info("Cursor advanced to rw_timestamp=%d", timestamp)
+    finally:
+        conn.close()
 
 
 def consume_events(config: EventsConfig) -> tuple[list[dict], int | None]:
-    """Consume pending events from RisingWave subscription.
+    """Consume pending events from a RisingWave subscription.
 
-    Uses cursor-based consumption with offset tracking via a local file.
-    Returns (rows, latest_rw_timestamp) where rows are dicts with column values
-    and latest_rw_timestamp is the highest rw_timestamp seen (for cursor persistence).
+    Connects via psycopg2, ensures all RisingWave objects exist (MV,
+    subscription, progress table), reads the cursor, declares a
+    subscription cursor SINCE that point, and fetches pending events.
 
-    Requires the `risingwave-py` package.
+    Returns (rows, latest_rw_timestamp). Does NOT advance the cursor —
+    the caller must call save_cursor() after successful sync.
     """
+    from psycopg2 import sql
+
+    conn = _connect(config)
+    rw = config.risingwave
+    q_sub = _qualified(rw.schema_name, rw.subscription_name)
+
     try:
-        from risingwave import OutputFormat, RisingWave, RisingWaveConnOptions
-    except ImportError:
-        raise ImportError(
-            "RisingWave support requires the 'risingwave-py' package. "
-            "Install with: pip install risingwave-py"
-        ) from None
+        _ensure_risingwave_objects(conn, rw)
+        last_ts = _read_cursor(conn, rw)
 
-    rw_config = config.risingwave
-    rw = RisingWave(
-        RisingWaveConnOptions.from_connection_info(
-            host=rw_config.host,
-            port=rw_config.port,
-            user=rw_config.user,
-            password=rw_config.password,
-            database=rw_config.database,
-        )
-    )
+        cur = conn.cursor()
 
-    cursor_name = "ics_cursor"
-    last_ts = _load_cursor_timestamp(rw_config.cursor_path)
+        if last_ts is not None:
+            cur.execute(sql.SQL(
+                "DECLARE ics_cursor SUBSCRIPTION CURSOR FOR {} SINCE %s"
+            ).format(q_sub), (last_ts,))
+            logger.info("Resuming from rw_timestamp=%d", last_ts)
+        else:
+            cur.execute(sql.SQL(
+                "DECLARE ics_cursor SUBSCRIPTION CURSOR FOR {}"
+            ).format(q_sub))
+            logger.info("No cursor found, starting from current position")
 
-    # Declare subscription cursor
-    if last_ts is not None:
-        since_clause = f"SINCE {last_ts}"
-    else:
-        since_clause = "SINCE begin()"
+        all_rows: list[dict] = []
+        latest_timestamp: int | None = None
+        remaining = config.max_events
 
-    rw.execute(
-        f"DECLARE {cursor_name} SUBSCRIPTION CURSOR FOR "
-        f"{rw_config.subscription_name} {since_clause}"
-    )
+        while remaining > 0:
+            cur.execute("FETCH NEXT FROM ics_cursor")
+            row = cur.fetchone()
+            if row is None:
+                break
 
-    all_rows: list[dict] = []
-    latest_timestamp: int | None = None
-    remaining = config.max_events
-
-    while remaining > 0:
-        result = rw.fetch(
-            f"FETCH NEXT FROM {cursor_name}",
-            format=OutputFormat.DATACLASS,
-        )
-        if not result:
-            break
-
-        for row in result:
-            row_dict = row if isinstance(row, dict) else dict(row)
+            row_dict = _tuple_to_dict(row)
             all_rows.append(row_dict)
 
             rw_ts = row_dict.get("rw_timestamp")
@@ -234,16 +328,29 @@ def consume_events(config: EventsConfig) -> tuple[list[dict], int | None]:
             ):
                 latest_timestamp = rw_ts
 
-        remaining -= len(result)
+            remaining -= 1
 
-    logger.info(
-        "Consumed %d events from RisingWave subscription '%s'",
-        len(all_rows),
-        rw_config.subscription_name,
-    )
+        logger.info(
+            "Consumed %d events from RisingWave subscription '%s'",
+            len(all_rows),
+            rw.subscription_name,
+        )
 
-    # Persist cursor position
-    if latest_timestamp is not None:
-        _save_cursor_timestamp(rw_config.cursor_path, latest_timestamp)
+        return all_rows, latest_timestamp
+    finally:
+        conn.close()
 
-    return all_rows, latest_timestamp
+
+# Column order from the lakekeeper_events MV + subscription metadata.
+# The subscription appends op (INT16) and rw_timestamp (BIGINT) columns
+# after the MV columns.
+_MV_COLUMNS = (
+    "id", "type", "source", "namespace", "name",
+    "tabular_id", "warehouse_id", "trace_id", "data",
+    "op", "rw_timestamp",
+)
+
+
+def _tuple_to_dict(row: tuple) -> dict:
+    """Convert a raw tuple from FETCH into a dict using MV column order."""
+    return dict(zip(_MV_COLUMNS, row))

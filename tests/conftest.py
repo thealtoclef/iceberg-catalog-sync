@@ -34,7 +34,7 @@ def base_config() -> AppConfig:
                 name="dest", uri="http://dest:8181", warehouse="wh"
             ),
         ),
-        sync=SyncBehaviorConfig(namespaces=["test_ns"]),
+        sync=SyncBehaviorConfig(),
         retry=RetryConfig(max_attempts=1),
         log=LogConfig(level="DEBUG"),
     )
