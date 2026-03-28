@@ -1,0 +1,28 @@
+[project]
+name = "iceberg-catalog-sync"
+version = "0.1.0"
+description = "Sync Iceberg table metadata between two Iceberg REST catalogs"
+requires-python = ">=3.10"
+dependencies = [
+    "pyiceberg>=0.11.1,<1.0",
+    "click>=8.0",
+    "pydantic>=2.0,<3.0",
+    "pyyaml>=6.0",
+    "tenacity>=8.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
+
+[project.optional-dependencies]
+risingwave = ["risingwave-py"]
+
+[project.scripts]
+iceberg-catalog-sync = "iceberg_catalog_sync.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-cov"]
